@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import logging
 import os
+import random
+import re
 import shutil
 import signal
 import sys
@@ -52,6 +54,15 @@ MIN_FREE_BYTES = int(MIN_FREE_GB * 1024**3)
 CYCLE_SLEEP_SECONDS = float(os.getenv("CYCLE_SLEEP_SECONDS", "2.5"))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "600"))
 
+# Rate-limit / token exhaustion backoff (seconds)
+RATE_LIMIT_BASE_DELAY = float(os.getenv("RATE_LIMIT_BASE_DELAY", "60"))
+RATE_LIMIT_MAX_DELAY = float(os.getenv("RATE_LIMIT_MAX_DELAY", "1800"))
+
+RATE_LIMIT_PATTERNS = re.compile(
+    r"429|rate\s*limit|too\s*many\s*requests|token.*exhaust|quota.*exceed|exhausted",
+    re.IGNORECASE,
+)
+
 # Deep technical categories — rotated endlessly; batch_index selects subsection.
 PROGRAMMING_TOPICS: list[str] = [
     "distributed_systems_consensus_and_replication",
@@ -79,7 +90,32 @@ PROGRAMMING_TOPICS: list[str] = [
     "stream_processing_windowing_and_state_stores",
     "ci_cd_pipeline_artifacts_and_deployment_specs",
     "language_runtime_gc_and_ffi_boundaries",
+    # Software & system architecture
+    "design_patterns_structural_creational_behavioral",
+    "system_architecture_schemas_and_microservices_patterns",
+    "database_data_models_sql_nosql_entity_relationship",
+    "api_structural_contracts_openapi_graphql_schemas",
+    "data_structures_algorithms_graph_traversals_tree_balance",
+    "concurrency_memory_management_low_level_systems",
+    "owasp_top10_hardening_rbac_authorization_matrices",
+    "performance_anti_patterns_n_plus_one_memory_leaks_thread_starvation",
+    "distributed_fault_tolerance_saga_event_sourcing_circuit_breakers",
+    "iac_kubernetes_dependency_trees_multistage_docker",
+    # Autonomous AI drones & robotics
+    "flight_controller_apis_mavlink_px4_ardupilot",
+    "edge_computer_vision_yolo_opencv_jetson_pipelines",
+    "sensor_fusion_slam_point_clouds_kalman_state_vectors",
+    "autonomous_pathfinding_rrt_astar_obstacle_avoidance_graphs",
+    "drone_failsafe_state_machines_signal_loss_lipo_telemetry",
+    # Internet of Things (IoT) & embedded systems
+    "Lightweight IoT Messaging (MQTT QoS Topologies, CoAP Contracts, Telemetry Streams)",
+    "Hardware Serial Communication Interfaces (I2C, SPI, UART Frame Layouts, GPIO Interrupts)",
+    "Real-Time Operating Systems (FreeRTOS Task Scheduling, Mutex State Architectures)",
+    "IoT Edge Security (TPM/HSM Schemas, TLS Pre-Shared Keys, Secure OTA Firmware State Machines)",
 ]
+
+# Alias for callers expecting lowercase naming
+programming_topics = PROGRAMMING_TOPICS
 
 _shutdown_requested = False
 
@@ -120,7 +156,7 @@ def disk_guard_ok() -> bool:
 
 
 def build_extraction_prompt(topic: str, batch_index: int) -> str:
-    """Force structured, programming-only output — no conversational filler."""
+    """Force depth-structured Markdown — three required headers, no conversational filler."""
     variant = batch_index % 12
     depth_hints = [
         "foundational definitions and canonical diagrams",
@@ -144,14 +180,40 @@ TOPIC: {topic}
 SUBSECTION (batch {batch_index}): {depth}
 
 STRICT OUTPUT RULES:
-1. NO greetings, apologies, disclaimers, or conversational prose.
-2. NO markdown headings like "Introduction" or "Conclusion".
-3. Deliver at least TWO of: (a) DDL/SQL or JSON Schema, (b) ASCII or mermaid diagram, (c) typed pseudocode or interface blocks, (d) data tables with column types.
-4. Every field, column, and type MUST be named explicitly.
-5. Prefer YAML/JSON blocks, SQL CREATE TABLE, OpenAPI fragments, Protobuf-style messages, or AST node enumerations as appropriate to the topic.
-6. Maximum density: production-grade specs a senior engineer could implement from directly.
+1. NO greetings, apologies, disclaimers, preambles, or conversational prose.
+2. Output MUST use exactly these three Markdown headers in this order (no other top-level headings):
+   ## Architectural Overview
+   ## Component Schemas & Data Models
+   ## Boundary Edge Cases & Failures
+3. Under each header, provide raw technical content only: code structs, JSON/YAML blocks, SQL DDL, typed tables, state-machine tables, or pseudocode.
+4. Every field, column, signal, register, and type MUST be named explicitly.
+5. Maximum density: production-grade specs a senior engineer could implement from directly.
 
-Begin output immediately with structured content."""
+Begin output immediately with:
+
+## Architectural Overview"""
+
+
+def is_rate_limit_error(exc: BaseException) -> bool:
+    """Detect token exhaustion, quota, or HTTP 429 rate-limit conditions."""
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+        return True
+    parts: list[str] = [str(exc)]
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            parts.append(exc.response.text)
+        except Exception:
+            pass
+    combined = " ".join(parts)
+    return bool(RATE_LIMIT_PATTERNS.search(combined))
+
+
+def rate_limit_cooldown_seconds(consecutive_hits: int) -> float:
+    """Exponential backoff capped at RATE_LIMIT_MAX_DELAY, plus jitter."""
+    base = RATE_LIMIT_BASE_DELAY * (2**consecutive_hits)
+    delay = min(base, RATE_LIMIT_MAX_DELAY)
+    jitter = random.uniform(0, delay * 0.15)
+    return delay + jitter
 
 
 def call_local_llm(prompt: str) -> str:
@@ -174,6 +236,33 @@ def call_local_llm(prompt: str) -> str:
     if not text:
         raise RuntimeError("Local LLM returned empty response")
     return text
+
+
+def call_local_llm_resilient(
+    prompt: str,
+    *,
+    rate_limit_streak: int = 0,
+) -> tuple[str, int]:
+    """
+    Call the local LLM with exponential backoff + jitter on rate-limit errors.
+
+    Returns (response_text, updated_consecutive_rate_limit_hits).
+    Resets streak to 0 on success.
+    """
+    streak = rate_limit_streak
+    while True:
+        try:
+            return call_local_llm(prompt), 0
+        except Exception as exc:
+            if not is_rate_limit_error(exc):
+                raise
+            cooldown = rate_limit_cooldown_seconds(streak)
+            log.warning(
+                "⚠️ Token limit reached. Cooling down for %d seconds...",
+                int(cooldown),
+            )
+            time.sleep(cooldown)
+            streak += 1
 
 
 def observe_extraction(
@@ -210,11 +299,20 @@ def connect_iii() -> Any:
     return worker
 
 
-def run_cycle(iii: Any, topic: str, batch_index: int) -> None:
+def run_cycle(
+    iii: Any,
+    topic: str,
+    batch_index: int,
+    *,
+    rate_limit_streak: int = 0,
+) -> int:
+    """Run one extract→observe cycle. Returns updated rate-limit streak (0 on success)."""
     prompt = build_extraction_prompt(topic, batch_index)
     log.info("Extracting [%s] batch=%d via %s", topic, batch_index, OLLAMA_MODEL)
 
-    content = call_local_llm(prompt)
+    content, rate_limit_streak = call_local_llm_resilient(
+        prompt, rate_limit_streak=rate_limit_streak
+    )
     result = observe_extraction(
         iii,
         topic=topic,
@@ -223,6 +321,7 @@ def run_cycle(iii: Any, topic: str, batch_index: int) -> None:
     )
     obs_id = result.get("id") or result.get("observationId") or "ok"
     log.info("Observed %s chars → mem::observe (%s)", len(content), obs_id)
+    return rate_limit_streak
 
 
 def main() -> int:
@@ -248,6 +347,7 @@ def main() -> int:
 
     topic_index = 0
     batch_index = 0
+    rate_limit_streak = 0
 
     while not _shutdown_requested:
         if not disk_guard_ok():
@@ -257,11 +357,34 @@ def main() -> int:
         topic_index += 1
 
         try:
-            run_cycle(iii, topic, batch_index)
+            rate_limit_streak = run_cycle(
+                iii,
+                topic,
+                batch_index,
+                rate_limit_streak=rate_limit_streak,
+            )
         except httpx.HTTPError as exc:
-            log.error("LLM HTTP error: %s — retrying next cycle.", exc)
+            if is_rate_limit_error(exc):
+                cooldown = rate_limit_cooldown_seconds(rate_limit_streak)
+                log.warning(
+                    "⚠️ Token limit reached. Cooling down for %d seconds...",
+                    int(cooldown),
+                )
+                time.sleep(cooldown)
+                rate_limit_streak += 1
+            else:
+                log.error("LLM HTTP error: %s — retrying next cycle.", exc)
         except Exception as exc:
-            log.error("Cycle failed: %s — retrying next cycle.", exc, exc_info=True)
+            if is_rate_limit_error(exc):
+                cooldown = rate_limit_cooldown_seconds(rate_limit_streak)
+                log.warning(
+                    "⚠️ Token limit reached. Cooling down for %d seconds...",
+                    int(cooldown),
+                )
+                time.sleep(cooldown)
+                rate_limit_streak += 1
+            else:
+                log.error("Cycle failed: %s — retrying next cycle.", exc, exc_info=True)
 
         batch_index += 1
         time.sleep(CYCLE_SLEEP_SECONDS)
